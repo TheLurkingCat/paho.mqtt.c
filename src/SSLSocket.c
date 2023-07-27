@@ -43,6 +43,10 @@
 #include <openssl/err.h>
 #include <openssl/crypto.h>
 #include <openssl/x509v3.h>
+#if (OPENSSL_VERSION_MAJOR >= 3)
+#include <openssl/ui.h>
+#include <openssl/store.h>
+#endif
 
 extern Sockets mod_s;
 
@@ -57,6 +61,10 @@ void SSL_CTX_msg_callback(
 		const void* buf, size_t len,
 		SSL* ssl, void* arg);
 int pem_passwd_cb(char* buf, int size, int rwflag, void* userdata);
+#if (OPENSSL_VERSION_MAJOR >= 3)
+int uiReader(UI* ui, UI_STRING* uis);
+int uiWriter(UI* ui, UI_STRING* uis);
+#endif
 int SSL_create_mutex(ssl_mutex_type* mutex);
 int SSL_lock_mutex(ssl_mutex_type* mutex);
 int SSL_unlock_mutex(ssl_mutex_type* mutex);
@@ -340,7 +348,35 @@ int pem_passwd_cb(char* buf, int size, int rwflag, void* userdata)
 	FUNC_EXIT_RC(rc);
 	return rc;
 }
+#if (OPENSSL_VERSION_MAJOR >= 3)
+int uiReader(UI* ui, UI_STRING* uis) {
+	switch (UI_get_string_type(uis)) {
+		case UIT_PROMPT:
+		case UIT_VERIFY:
+			const char* password = UI_get0_user_data(ui);
+			if (password && (UI_get_input_flags(uis) & UI_INPUT_FLAG_DEFAULT_PWD)) {
+				UI_set_result(ui, uis, password);
+				return 1;
+			}
+		default:
+			break;
+	}
+	return (UI_method_get_reader(UI_OpenSSL()))(ui, uis);
+}
 
+int uiWriter(UI* ui, UI_STRING* uis) {
+	switch (UI_get_string_type(uis)) {
+		case UIT_PROMPT:
+		case UIT_VERIFY:
+			if (UI_get0_user_data(ui) && (UI_get_input_flags(uis) & UI_INPUT_FLAG_DEFAULT_PWD)) {
+				return 1;
+			}
+		default:
+			break;
+	}
+	return (UI_method_get_writer(UI_OpenSSL()))(ui, uis);
+}
+#endif
 int SSL_create_mutex(ssl_mutex_type* mutex)
 {
 	int rc = 0;
@@ -552,6 +588,12 @@ int SSLSocket_createContext(networkHandles* net, MQTTClient_SSLOptions* opts)
 	{
 #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
 		net->ctx = SSL_CTX_new(TLS_client_method());
+#ifdef LIMIT_ALG
+		SSL_CTX_set_min_proto_version(net->ctx, TLS1_2_VERSION);
+		SSL_CTX_set_max_proto_version(net->ctx, TLS1_2_VERSION);
+		SSL_CTX_set1_curves_list(net->ctx, "x25519");
+		SSL_CTX_set1_client_sigalgs_list(net->ctx, "rsa_pkcs1_sha256");
+#endif
 #else
 		int sslVersion = MQTT_SSL_VERSION_DEFAULT;
 		if (opts->struct_version >= 1) sslVersion = opts->sslVersion;
@@ -613,6 +655,22 @@ int SSLSocket_createContext(networkHandles* net, MQTTClient_SSLOptions* opts)
 		if (opts->privateKey == NULL)
 			opts->privateKey = opts->keyStore;   /* the privateKey can be included in the keyStore */
 
+#if (OPENSSL_VERSION_MAJOR >= 3)
+		UI_METHOD* tpmui = UI_create_method("OpenSSL 3 User Interface");
+		UI_method_set_opener(tpmui, UI_method_get_opener(UI_OpenSSL()));
+		UI_method_set_closer(tpmui, UI_method_get_closer(UI_OpenSSL()));
+		UI_method_set_reader(tpmui, uiReader);
+		UI_method_set_writer(tpmui, uiWriter);
+
+		OSSL_STORE_CTX* osslstore = OSSL_STORE_open(opts->privateKey, tpmui, (void*)opts->privateKeyPassword, NULL, NULL);
+		OSSL_STORE_INFO *storeInfo = OSSL_STORE_load(osslstore);
+		net->pkey = OSSL_STORE_INFO_get1_PKEY(storeInfo);
+		rc = SSL_CTX_use_PrivateKey(net->ctx, net->pkey);
+
+		OSSL_STORE_INFO_free(storeInfo);
+		OSSL_STORE_close(osslstore);
+		UI_destroy_method(tpmui);
+#else
 		if (opts->privateKeyPassword != NULL)
 		{
 			SSL_CTX_set_default_passwd_cb(net->ctx, pem_passwd_cb);
@@ -621,6 +679,7 @@ int SSLSocket_createContext(networkHandles* net, MQTTClient_SSLOptions* opts)
 
 		/* support for ASN.1 == DER format? DER can contain only one certificate? */
 		rc = SSL_CTX_use_PrivateKey_file(net->ctx, opts->privateKey, SSL_FILETYPE_PEM);
+#endif
 		if (opts->privateKey == opts->keyStore)
 			opts->privateKey = NULL;
 		if (rc != 1)
@@ -700,7 +759,9 @@ int SSLSocket_createContext(networkHandles* net, MQTTClient_SSLOptions* opts)
 free_ctx:
 	SSL_CTX_free(net->ctx);
 	net->ctx = NULL;
-
+	if (net->pkey)
+		EVP_PKEY_free(net->pkey);
+	net->pkey = NULL;
 exit:
 	FUNC_EXIT_RC(rc);
 	return rc;
@@ -937,6 +998,9 @@ void SSLSocket_destroyContext(networkHandles* net)
 	if (net->ctx)
 		SSL_CTX_free(net->ctx);
 	net->ctx = NULL;
+	if (net->pkey)
+		EVP_PKEY_free(net->pkey);
+	net->pkey = NULL;
 	FUNC_EXIT;
 }
 
@@ -1042,7 +1106,7 @@ int SSLSocket_putdatas(SSL* ssl, SOCKET socket, char* buf0, size_t buf0len, Pack
 		    	free(bufs.buffers[i]);
 		    	bufs.buffers[i] = NULL;
 		    }
-		}	
+		}
 	}
 exit:
 	FUNC_EXIT_RC(rc);
